@@ -22,6 +22,10 @@ function loadConfig() {
     logLevel: 'info',
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
+    keysFile: 'keys.json',
+    keyRotationMinMinutes: 3,
+    keyRotationMaxMinutes: 6,
+    keyRetryAfterHours: 24,
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -41,6 +45,10 @@ function loadConfig() {
   if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
+  if (process.env.CC_KEYS_FILE) defaults.keysFile = process.env.CC_KEYS_FILE;
+  if (process.env.CC_KEY_ROTATION_MIN_MINUTES) defaults.keyRotationMinMinutes = parseInt(process.env.CC_KEY_ROTATION_MIN_MINUTES);
+  if (process.env.CC_KEY_ROTATION_MAX_MINUTES) defaults.keyRotationMaxMinutes = parseInt(process.env.CC_KEY_ROTATION_MAX_MINUTES);
+  if (process.env.CC_KEY_RETRY_AFTER_HOURS) defaults.keyRetryAfterHours = parseFloat(process.env.CC_KEY_RETRY_AFTER_HOURS);
 
   return defaults;
 }
@@ -155,6 +163,115 @@ function log(level, msg, data) {
   if (CFG.logFile) {
     try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
   }
+}
+
+// ── Key 池（多 Key 轮换）──────────────────────────
+// keys.json 存在且非空时启用：忽略请求头里的 key，按随机周期轮换池内 key。
+// 文件缺失/为空时完全退回单 key 行为，方便与上游合并。
+const KEY_STATE = new Map(); // key -> { disabledUntil, reason, disabledAt }
+
+function loadKeyPool() {
+  const file = resolve(__dirname, CFG.keysFile || 'keys.json');
+  if (!existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    if (!Array.isArray(parsed)) return [];
+    const keys = [...new Set(parsed.map(k => String(k || '').trim()).filter(Boolean))];
+    if (keys.length) log('info', 'Key pool loaded', { count: keys.length, file });
+    return keys;
+  } catch (e) {
+    log('warn', 'Key pool load failed, falling back to single key', { error: e.message });
+    return [];
+  }
+}
+
+const KEY_POOL = loadKeyPool();
+const KEY_POOL_ENABLED = KEY_POOL.length > 0;
+const rotation = { index: 0, periodMs: 0, startedAt: 0 };
+
+function nextRotationPeriodMs() {
+  const minMs = (CFG.keyRotationMinMinutes || 3) * 60_000;
+  const maxMs = (CFG.keyRotationMaxMinutes || 6) * 60_000;
+  if (maxMs <= minMs) return minMs;
+  return minMs + Math.floor(Math.random() * (maxMs - minMs));
+}
+
+function isKeyDisabled(key, now = Date.now()) {
+  const state = KEY_STATE.get(key);
+  return Boolean(state && now < state.disabledUntil);
+}
+
+function disableKey(key, reason) {
+  const hours = CFG.keyRetryAfterHours || 24;
+  KEY_STATE.set(key, {
+    disabledUntil: Date.now() + hours * 3_600_000,
+    reason,
+    disabledAt: Date.now(),
+  });
+  log('warn', 'Key disabled for cooldown', {
+    keyPrefix: key.slice(0, 8),
+    reason,
+    retryAfterHours: hours,
+    disabled: `${KEY_STATE.size}/${KEY_POOL.length}`,
+  });
+}
+
+// 冷却到期后不主动探测：key 只是重新进入候选，下次真实请求轮到它时再试一次；
+// 成功即解除禁用，失败按新原因重新冷却。
+function noteKeyHealth(apiKey, ok) {
+  if (!KEY_POOL_ENABLED) return;
+  if (ok && KEY_STATE.delete(apiKey)) {
+    log('info', 'Key recovered', { keyPrefix: apiKey.slice(0, 8) });
+  }
+}
+
+function pickActiveKey() {
+  const now = Date.now();
+  if (rotation.periodMs === 0) {
+    rotation.startedAt = now;
+    rotation.periodMs = nextRotationPeriodMs();
+  } else if (now - rotation.startedAt >= rotation.periodMs) {
+    rotation.index = (rotation.index + 1) % KEY_POOL.length;
+    rotation.startedAt = now;
+    rotation.periodMs = nextRotationPeriodMs();
+    log('info', 'Key rotation', {
+      keyPrefix: KEY_POOL[rotation.index].slice(0, 8),
+      nextInMinutes: Math.round(rotation.periodMs / 60000),
+    });
+  }
+  for (let i = 0; i < KEY_POOL.length; i++) {
+    const candidate = KEY_POOL[(rotation.index + i) % KEY_POOL.length];
+    if (!isKeyDisabled(candidate, now)) return candidate;
+  }
+  return null; // 全部冷却中
+}
+
+// 402 必禁；403 也禁（认证被拒继续重试有风控风险）；429 仅明确额度类才禁。
+function keyDisableReason(status, bodyText) {
+  if (status === 402) return 'payment-required';
+  if (status === 403) return 'auth-rejected';
+  if (status === 429) {
+    const text = String(bodyText || '').toLowerCase();
+    if (/quota|credit|insufficient|balance|billing/.test(text)) return 'quota-exhausted';
+  }
+  return null;
+}
+
+function allKeysDisabledBody() {
+  const keys = [...KEY_STATE.entries()].map(([key, state]) => ({
+    keyPrefix: key.slice(0, 8),
+    reason: state.reason,
+    retryAt: new Date(state.disabledUntil).toISOString(),
+  }));
+  return {
+    error: { message: 'All Command Code keys are in cooldown', type: 'rate_limit_error' },
+    retry_after: 60,
+    keys,
+  };
+}
+
+function resolveApiKey(headers) {
+  return KEY_POOL_ENABLED ? pickActiveKey() : getApiKey(headers);
 }
 
 // ── 会话管理 ───────────────────────────────────────
@@ -689,8 +806,8 @@ function mapCcError(ccStatus, ccBody) {
     }
   }
 
-  // CC 429 响应可能带 retry-after
-  if (ccStatus === 429) {
+  // CC 402/429 响应可能带 retry-after（402 映射成 429 让 SDK 自动重试并切 key）
+  if (ccStatus === 402 || ccStatus === 429) {
     return {
       status: 429,
       body: {
@@ -788,8 +905,12 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = resolveApiKey(req.headers);
   if (!apiKey) {
+    if (KEY_POOL_ENABLED) {
+      sendJSON(res, 503, allKeysDisabledBody());
+      return;
+    }
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
   }
@@ -819,11 +940,14 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status });
+      log('error', 'CC API error', { status: ccResponse.status, keyPrefix: apiKey.slice(0, 8) });
+      const disableReason = KEY_POOL_ENABLED ? keyDisableReason(ccResponse.status, errorText) : null;
+      if (disableReason) disableKey(apiKey, disableReason);
       const mapped = mapCcError(ccResponse.status, errorText);
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
+    noteKeyHealth(apiKey, true);
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1500,8 +1624,12 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = resolveApiKey(req.headers);
   if (!apiKey) {
+    if (KEY_POOL_ENABLED) {
+      sendJSON(res, 503, allKeysDisabledBody());
+      return;
+    }
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
   }
@@ -1528,11 +1656,14 @@ async function handleMessages(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, keyPrefix: apiKey.slice(0, 8) });
+      const disableReason = KEY_POOL_ENABLED ? keyDisableReason(ccResponse.status, errorText) : null;
+      if (disableReason) disableKey(apiKey, disableReason);
       const mapped = mapCcError(ccResponse.status, errorText);
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
+    noteKeyHealth(apiKey, true);
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1821,7 +1952,11 @@ async function fetchModels(apiKey) {
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
+  const apiKey = resolveApiKey(req.headers);
+  if (!apiKey && KEY_POOL_ENABLED) {
+    sendJSON(res, 503, allKeysDisabledBody());
+    return;
+  }
   const models = await fetchModels(apiKey);
   const now = nowUnix();
   sendJSON(res, 200, {

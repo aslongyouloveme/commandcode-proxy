@@ -5,5 +5,9 @@
   "apiBase": "https://api.commandcode.ai",
   "projectSlug": "cc-proxy",
   "logFile": "",
-  "logLevel": "info"
+  "logLevel": "info",
+  "keysFile": "keys.json",
+  "keyRotationMinMinutes": 3,
+  "keyRotationMaxMinutes": 6,
+  "keyRetryAfterHours": 24
 }
