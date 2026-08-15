@@ -246,13 +246,14 @@ function pickActiveKey() {
   return null; // 全部冷却中
 }
 
-// 402 必禁；403 也禁（认证被拒继续重试有风控风险）；429 仅明确额度类才禁。
+// 402 必禁；403 也禁（认证被拒继续重试有风控风险）；
+// 400/429 仅在响应正文明确表示额度/余额不足时才禁。
 function keyDisableReason(status, bodyText) {
   if (status === 402) return 'payment-required';
   if (status === 403) return 'auth-rejected';
-  if (status === 429) {
+  if (status === 400 || status === 429) {
     const text = String(bodyText || '').toLowerCase();
-    if (/quota|credit|insufficient|balance|billing/.test(text)) return 'quota-exhausted';
+    if (/quota|credit|insufficient|balance|billing|out\s+of\s+(?:usage|credits?)/.test(text)) return 'quota-exhausted';
   }
   return null;
 }
@@ -867,6 +868,44 @@ function getApiKey(headers) {
   return null;
 }
 
+// 对明确的额度/认证失败，在同一个请求内切到下一个 key 重试。
+// 只有真实请求返回这类错误才会触发，不做主动额度探测。
+async function forwardWithKeyFailover(initialApiKey, body, incomingHeaders, signal, context = '') {
+  let apiKey = initialApiKey;
+  const triedKeys = new Set();
+
+  while (apiKey && !triedKeys.has(apiKey)) {
+    triedKeys.add(apiKey);
+    await ensureInitialized(apiKey, signal);
+    const response = await forwardToCC(body, apiKey, incomingHeaders, signal);
+
+    if (response.ok) {
+      noteKeyHealth(apiKey, true);
+      return { apiKey, response, errorText: '' };
+    }
+
+    const errorText = await response.text().catch(() => '');
+    log('error', `CC API error${context}`, { status: response.status, keyPrefix: apiKey.slice(0, 8) });
+    const disableReason = KEY_POOL_ENABLED ? keyDisableReason(response.status, errorText) : null;
+    if (!disableReason) return { apiKey, response, errorText };
+
+    disableKey(apiKey, disableReason);
+    const nextKey = pickActiveKey();
+    if (!nextKey || triedKeys.has(nextKey)) {
+      return { apiKey, response, errorText, allKeysDisabled: true };
+    }
+
+    log('warn', 'Retrying CC request with next key', {
+      fromKeyPrefix: apiKey.slice(0, 8),
+      toKeyPrefix: nextKey.slice(0, 8),
+      reason: disableReason,
+    });
+    apiKey = nextKey;
+  }
+
+  return { apiKey: null, response: null, errorText: '', allKeysDisabled: true };
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
@@ -905,7 +944,7 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = resolveApiKey(req.headers);
+  let apiKey = resolveApiKey(req.headers);
   if (!apiKey) {
     if (KEY_POOL_ENABLED) {
       sendJSON(res, 503, allKeysDisabledBody());
@@ -933,21 +972,20 @@ async function handleChatCompletions(req, res) {
   let translator = null;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    // 首次初始化 + 转发；额度/认证失败时在同一请求内切换下一个 key
+    const attempt = await forwardWithKeyFailover(apiKey, ccBody, req.headers, abortController.signal);
+    apiKey = attempt.apiKey;
+    const ccResponse = attempt.response;
 
+    if (!ccResponse) {
+      sendJSON(res, 503, allKeysDisabledBody());
+      return;
+    }
     if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, keyPrefix: apiKey.slice(0, 8) });
-      const disableReason = KEY_POOL_ENABLED ? keyDisableReason(ccResponse.status, errorText) : null;
-      if (disableReason) disableKey(apiKey, disableReason);
-      const mapped = mapCcError(ccResponse.status, errorText);
+      const mapped = mapCcError(ccResponse.status, attempt.errorText);
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
-    noteKeyHealth(apiKey, true);
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
@@ -1624,7 +1662,7 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = resolveApiKey(req.headers);
+  let apiKey = resolveApiKey(req.headers);
   if (!apiKey) {
     if (KEY_POOL_ENABLED) {
       sendJSON(res, 503, allKeysDisabledBody());
@@ -1650,20 +1688,20 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    // 首次初始化 + 转发；额度/认证失败时在同一请求内切换下一个 key
+    const attempt = await forwardWithKeyFailover(apiKey, ccBody, req.headers, abortController.signal, ' (Anthropic)');
+    apiKey = attempt.apiKey;
+    const ccResponse = attempt.response;
 
+    if (!ccResponse) {
+      sendJSON(res, 503, allKeysDisabledBody());
+      return;
+    }
     if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, keyPrefix: apiKey.slice(0, 8) });
-      const disableReason = KEY_POOL_ENABLED ? keyDisableReason(ccResponse.status, errorText) : null;
-      if (disableReason) disableKey(apiKey, disableReason);
-      const mapped = mapCcError(ccResponse.status, errorText);
+      const mapped = mapCcError(ccResponse.status, attempt.errorText);
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
-    noteKeyHealth(apiKey, true);
 
     // 下游断连检测：打断 CC 上游 + 记录日志
     res.on('close', () => {
