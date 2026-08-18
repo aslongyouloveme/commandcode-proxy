@@ -325,6 +325,17 @@ function resolveApiKey(headers) {
   return KEY_POOL_ENABLED ? pickActiveKey() : getApiKey(headers);
 }
 
+// ── 服务器模式访问闸门 ─────────────────────
+// 客户端必须出示与启动 key（CC_SERVER_KEY，服务器模式下存于 CFG.apiKey）一致的 user key；
+// 缺失/不匹配直接 401 拒绝。通过后才允许进入转发流程，上游鉴权/负载仍走 keys 池轮换。
+function passesServerGate(headers) {
+  if (!SERVER_MODE) return true; // 本地模式不设闸门
+  const bootstrap = String(CFG.apiKey || '').trim();
+  if (!/^user_[a-zA-Z0-9_-]+$/.test(bootstrap)) return false;
+  const supplied = getApiKey(headers);
+  return !!supplied && supplied === bootstrap;
+}
+
 // ── 会话管理 ───────────────────────────────────────
 // 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
 // 同一 Key 在同一周期内复用，到期自动换新
@@ -991,6 +1002,11 @@ async function handleChatCompletions(req, res) {
     openaiReq = await readBody(req);
   } catch {
     sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
+
+  if (!passesServerGate(req.headers)) {
+    sendJSON(res, 401, { error: { message: 'Unauthorized: invalid or missing server key', type: 'authentication_error' } });
     return;
   }
 
@@ -1753,6 +1769,11 @@ async function handleMessages(req, res) {
     return;
   }
 
+  if (!passesServerGate(req.headers)) {
+    sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Unauthorized: invalid or missing server key' } });
+    return;
+  }
+
   let apiKey = resolveApiKey(req.headers);
   if (!apiKey) {
     if (KEY_POOL_ENABLED) {
@@ -2184,6 +2205,10 @@ async function handlePoolState(req, res) {
 }
 
 async function handleModels(req, res) {
+  if (!passesServerGate(req.headers)) {
+    sendJSON(res, 401, { object: 'error', error: { type: 'authentication_error', message: 'Unauthorized: invalid or missing server key' } });
+    return;
+  }
   const apiKey = resolveApiKey(req.headers);
   if (!apiKey && KEY_POOL_ENABLED) {
     sendJSON(res, 503, allKeysDisabledBody());
