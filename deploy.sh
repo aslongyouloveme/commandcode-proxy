@@ -294,9 +294,10 @@ transfer_image() {
     if [[ "$DRY_RUN" == "1" ]]; then
       echo -e "${YELLOW}[dry-run]${NC} docker save $FULL_IMAGE | gzip | $SSH_BASE $SERVER_USER@$SERVER_HOST 'gunzip | docker load'"
     else
-      local size
-      size=$(docker images "$FULL_IMAGE" --format "{{.Size}}" 2>/dev/null | head -n1 || echo "未知")
-      info "镜像大小: $size，传输中请稍候..."
+      local size="未知"
+      size="$(docker images "$FULL_IMAGE" --format '{{.Size}}' 2>/dev/null | head -n1 || true)"
+      [[ -n "$size" ]] || size="未知"
+      info "镜像大小: ${size}，传输中请稍候..."
       docker save "$FULL_IMAGE" | gzip | $SSH_BASE "$SERVER_USER@$SERVER_HOST" 'gunzip | docker load'
       log "传输完成"
     fi
@@ -442,18 +443,19 @@ if [ -n \"$CC_SERVER_KEYS_FILE\" ]; then echo \"[remote] 已挂载多 Key 池: $
 # ---------- 健康检查 ----------
 health_check() {
   step "健康检查"
+  local _hport="${HOST_PORT:-3050}" _hpath="${HEALTH_PATH:-/health}"
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo -e "${YELLOW}[dry-run]${NC} curl http://127.0.0.1:$HOST_PORT$HEALTH_PATH (远程)"
-    echo -e "${YELLOW}[dry-run]${NC} curl http://$SERVER_HOST:$HOST_PORT$HEALTH_PATH (本地)"
+    echo -e "${YELLOW}[dry-run]${NC} curl http://127.0.0.1:${_hport}${_hpath} (远程)"
+    echo -e "${YELLOW}[dry-run]${NC} curl http://$SERVER_HOST:${_hport}${_hpath} (本地)"
     return
   fi
 
   log "等待容器启动..."
   sleep 4
 
-  local remote_health="curl -fsS --max-time 5 http://127.0.0.1:$HOST_PORT$HEALTH_PATH || wget -qO- http://127.0.0.1:$HOST_PORT$HEALTH_PATH"
+  local remote_health="curl -fsS --max-time 5 http://127.0.0.1:${_hport}${_hpath} || wget -qO- http://127.0.0.1:${_hport}${_hpath}"
   if $SSH_BASE "$SERVER_USER@$SERVER_HOST" "$remote_health" 2>/dev/null | grep -q "OK"; then
-    log "远程健康检查通过 ✓ (http://127.0.0.1:$HOST_PORT$HEALTH_PATH → OK)"
+    log "远程健康检查通过 ✓ (http://127.0.0.1:${_hport}${_hpath} → OK)"
   else
     local ok=0
     for i in 1 2 3; do
@@ -470,11 +472,11 @@ health_check() {
   fi
 
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsS --max-time 5 "http://$SERVER_HOST:$HOST_PORT$HEALTH_PATH" 2>/dev/null | grep -q "OK"; then
-      log "公网健康检查通过 ✓ (http://$SERVER_HOST:$HOST_PORT$HEALTH_PATH)"
+    if curl -fsS --max-time 5 "http://$SERVER_HOST:${_hport}${_hpath}" 2>/dev/null | grep -q "OK"; then
+      log "公网健康检查通过 ✓ (http://$SERVER_HOST:${_hport}${_hpath})"
     else
-      warn "公网无法直接访问 http://$SERVER_HOST:$HOST_PORT$HEALTH_PATH，可能是安全组/防火墙未放行 $HOST_PORT 端口"
-      info "请检查: 云厂商安全组放行 $HOST_PORT/tcp，服务器防火墙: sudo ufw allow $HOST_PORT/tcp"
+      warn "公网无法直接访问 http://$SERVER_HOST:${_hport}${_hpath}，可能是安全组/防火墙未放行 $_hport 端口"
+      info "请检查: 云厂商安全组放行 $_hport/tcp，服务器防火墙: sudo ufw allow $_hport/tcp"
     fi
   fi
 }
