@@ -12,4 +12,3 @@ keys.server.json
 keys.*.json
 deploy.env
 .env
-config.server.json
