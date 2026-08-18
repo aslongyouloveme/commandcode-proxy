@@ -9,8 +9,17 @@ import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-// ── 配置加载 ──────────────────────────────────────
+// ── 配置加载（本地/服务器隔离）────────────────────
+// 本地:  config.json + keys.json，允许无 key 运行（请求头透传）
+// 服务器: config.server.json + keys.server.json，必须通过环境变量 CC_SERVER_KEY 注入启动 key
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// 是否为服务器模式：显式开关 CC_SERVER_MODE=1/true，或容器内默认由 compose/Dockerfile 注入
+function isServerMode() {
+  const v = String(process.env.CC_SERVER_MODE || '').toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+const SERVER_MODE = isServerMode();
 
 function loadConfig() {
   const defaults = {
@@ -22,23 +31,33 @@ function loadConfig() {
     logLevel: 'info',
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
-    keysFile: 'keys.json',
+    keysFile: SERVER_MODE ? 'keys.server.json' : 'keys.json',
     keyRotationMinMinutes: 3,
     keyRotationMaxMinutes: 6,
     keyRetryAfterHours: 24,
   };
 
-  const configPath = resolve(__dirname, 'config.json');
-  if (existsSync(configPath)) {
-    try {
-      const user = JSON.parse(readFileSync(configPath, 'utf-8'));
-      Object.assign(defaults, user);
-    } catch (e) {
-      console.error('[config] Failed to parse config.json:', e.message);
+  // 1) 选配置文件：服务器优先读 config.server.json，缺失则回退 config.json
+  const primaryPath = resolve(__dirname, SERVER_MODE ? 'config.server.json' : 'config.json');
+  const fallbackPath = resolve(__dirname, 'config.json');
+  const configPaths = SERVER_MODE ? [primaryPath, ...(primaryPath !== fallbackPath && !existsSync(primaryPath) ? [fallbackPath] : [])] : [primaryPath];
+  for (const p of configPaths) {
+    if (existsSync(p)) {
+      try {
+        const user = JSON.parse(readFileSync(p, 'utf-8'));
+        Object.assign(defaults, user);
+        console.log(`[config] Loaded ${p.split('/').pop()}${SERVER_MODE ? ' (server mode)' : ' (local mode)'}`);
+      } catch (e) {
+        console.error(`[config] Failed to parse ${p}:`, e.message);
+      }
+      break;
     }
   }
+  if (SERVER_MODE && !existsSync(primaryPath) && existsSync(fallbackPath)) {
+    console.warn('[config] config.server.json not found, fell back to config.json (server mode)');
+  }
 
-  // 环境变量覆写
+  // 2) 环境变量覆写
   if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
   if (process.env.HOST) defaults.host = process.env.HOST;
   if (process.env.CC_API_BASE) defaults.apiBase = process.env.CC_API_BASE;
@@ -49,6 +68,40 @@ function loadConfig() {
   if (process.env.CC_KEY_ROTATION_MIN_MINUTES) defaults.keyRotationMinMinutes = parseInt(process.env.CC_KEY_ROTATION_MIN_MINUTES);
   if (process.env.CC_KEY_ROTATION_MAX_MINUTES) defaults.keyRotationMaxMinutes = parseInt(process.env.CC_KEY_ROTATION_MAX_MINUTES);
   if (process.env.CC_KEY_RETRY_AFTER_HOURS) defaults.keyRetryAfterHours = parseFloat(process.env.CC_KEY_RETRY_AFTER_HOURS);
+  // apiKey 也支持环境变量（服务器模式的启动 key 走此分支）
+  if (process.env.CC_API_KEY) defaults.apiKey = String(process.env.CC_API_KEY).trim();
+  if (process.env.CC_SERVER_KEY) defaults.apiKey = String(process.env.CC_SERVER_KEY).trim();
+
+  // 3) 服务器模式强制校验：必须通过环境变量提供合法的 user_xxx
+  if (SERVER_MODE) {
+    const raw = String(process.env.CC_SERVER_KEY || process.env.CC_API_KEY || '').trim();
+    // 允许 "Bearer user_xxx" 前缀，提取出 user_ 部分做校验
+    const extracted = raw.match(/user_[a-zA-Z0-9_-]+/)?.[0] || '';
+    const ok = /^user_[a-zA-Z0-9_-]+$/.test(extracted);
+    if (!ok) {
+      console.error('');
+      console.error('[fatal] 服务器模式启动失败：缺少合法的环境变量 CC_SERVER_KEY');
+      console.error('  要求: CC_SERVER_KEY=user_xxx  (以 user_ 开头，仅支持字母数字 _-)');
+      console.error('  当前: ' + (raw ? raw.slice(0, 12) + '...' : '(空)'));
+      console.error('');
+      console.error('  修复方法:');
+      console.error('    本地 docker run:  -e CC_SERVER_MODE=1 -e CC_SERVER_KEY=user_xxx');
+      console.error('    docker compose:   在 deploy.env 填 CC_SERVER_KEY 或在服务器上 export CC_SERVER_KEY');
+      console.error('    deploy.sh:        在 deploy.env 填 CC_SERVER_KEY 后重新执行 ./deploy.sh');
+      console.error('');
+      process.exit(1);
+    }
+    // 以环境变量为准，覆盖文件中的 apiKey，确保服务器 key 与本地隔离
+    defaults.apiKey = extracted;
+    // 服务器默认读 keys.server.json，除非被 CC_KEYS_FILE 显式覆盖
+    if (!process.env.CC_KEYS_FILE && defaults.keysFile === 'keys.json') {
+      defaults.keysFile = 'keys.server.json';
+    }
+    console.log(`[config] Server mode enabled — bootstrap key: ${extracted.slice(0, 12)}... , keys file: ${defaults.keysFile}`);
+  } else {
+    // 本地模式：无 key 也允许启动，keys 读 keys.json
+    if (!process.env.CC_KEYS_FILE && !defaults.keysFile) defaults.keysFile = 'keys.json';
+  }
 
   return defaults;
 }
@@ -246,15 +299,12 @@ function pickActiveKey() {
   return null; // 全部冷却中
 }
 
-// 402 必禁；403 也禁（认证被拒继续重试有风控风险）；
-// 400/429 仅在响应正文明确表示额度/余额不足时才禁。
+// 任何非成功响应都禁用并尝试下一个 key，避免遗漏未知的额度/限速错误。
 function keyDisableReason(status, bodyText) {
   if (status === 402) return 'payment-required';
   if (status === 403) return 'auth-rejected';
-  if (status === 400 || status === 429) {
-    const text = String(bodyText || '').toLowerCase();
-    if (/quota|credit|insufficient|balance|billing|out\s+of\s+(?:usage|credits?)/.test(text)) return 'quota-exhausted';
-  }
+  if (status === 429) return 'rate-limited';
+  if (status >= 400) return `http-${status}`;
   return null;
 }
 
@@ -2032,6 +2082,107 @@ async function fetchModels(apiKey) {
   return MODELS;
 }
 
+// ── 池化额度聚合（本地环回只读，供托盘展示多 key 额度）─────────────
+const POOL_USAGE_CACHE_TTL_MS = 60 * 1000; // 60s 缓存，避免风控
+let poolUsageCache = { at: 0, data: null };
+// 解析 /alpha/billing/credits 返回为 metrics（复用 provider-account-usage 语义）
+function toPoolMetrics(payload) {
+  const wl = payload?.windowLimits || payload?.window_limits;
+  if(!wl || typeof wl !== 'object') return [];
+  const pick = (d) => {
+    if(!d || typeof d !== 'object') return null;
+    const cap = Number(d.cap ?? d.limit);
+    const used = Number(d.used);
+    if(!Number.isFinite(cap) || !Number.isFinite(used)) return null;
+    const remaining = cap - used;
+    const usedPercent = cap>0 ? (used/cap)*100 : 0;
+    const resetAt = d.resetAt ? Number(d.resetAt) : (d.reset_at ? Number(d.reset_at) : undefined);
+    const resetSec = Number.isFinite(resetAt) ? (resetAt > 1e12 ? resetAt/1000 : resetAt) : undefined;
+    return { cap, used, remaining, usedPercent, remainingPercent: 100-usedPercent, resetAt: resetSec };
+  };
+  const out=[];
+  const five = pick(wl.fiveHour ?? wl.five_hour);
+  if(five) out.push({kind:'quota', label:'5-hour limit', unit:'credits', ...five, limit: five.cap});
+  const weekly = pick(wl.weekly);
+  if(weekly) out.push({kind:'quota', label:'Weekly limit', unit:'credits', ...weekly, limit: weekly.cap});
+  return out;
+}
+async function fetchCreditsForKey(key) {
+  try {
+    const res = await fetch(`${CFG.apiBase}/alpha/billing/credits`, {
+      headers: { Authorization: `Bearer ${key}`, 'x-command-code-version': CC_VERSION },
+      signal: AbortSignal.timeout(8000)
+    });
+    if(!res.ok) {
+      const t = await res.text().catch(()=> '');
+      return { ok: false, status: res.status, error: t.slice(0,500) };
+    }
+    const j = await res.json().catch(()=> ({}));
+    const metrics = toPoolMetrics(j);
+    return { ok: true, metrics, raw: j };
+  } catch(e) {
+    return { ok: false, error: e.message };
+  }
+}
+async function handlePoolUsage(req, res) {
+  // 仅本机可访问
+  const host = (req.headers.host || '').split(':')[0];
+  const remote = (req.socket.remoteAddress || '');
+  const isLoopback = host === '127.0.0.1' || host === 'localhost' || remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  if(!isLoopback) { sendJSON(res, 403, { error: { message: 'pool usage is loopback-only', type: 'forbidden'}}); return; }
+  if(!KEY_POOL_ENABLED) {
+    // 单 key 回退：用 router 单 key 的同接口数据占位，托盘仍能展示
+    const singleKey = CFG.apiKey || null;
+    if(!singleKey) { sendJSON(res, 200, { poolEnabled:false, fetchedAt: new Date().toISOString(), keys: [] }); return; }
+    const now = Date.now();
+    if(poolUsageCache.data && (now - poolUsageCache.at) < POOL_USAGE_CACHE_TTL_MS && !poolUsageCache.data._pool) {
+      sendJSON(res, 200, poolUsageCache.data); return;
+    }
+    const one = await fetchCreditsForKey(singleKey);
+    const data = { poolEnabled:false, loopbackOnly:true, fetchedAt:new Date().toISOString(), cacheTtlMs: POOL_USAGE_CACHE_TTL_MS, keys:[{ keyPrefix: singleKey.slice(0,8), disabled:false, reason:null, disabledUntil:null, credits: one }]};
+    data._pool=false; poolUsageCache={at:now, data}; sendJSON(res,200,data); return;
+  }
+  const now = Date.now();
+  if(poolUsageCache.data && (now - poolUsageCache.at) < POOL_USAGE_CACHE_TTL_MS && poolUsageCache.data._pool) {
+    sendJSON(res, 200, poolUsageCache.data); return;
+  }
+  const results = await Promise.all(KEY_POOL.map(async (k) => {
+    const state = KEY_STATE.get(k);
+    const disabled = !!(state && Date.now() < state.disabledUntil);
+    const credits = await fetchCreditsForKey(k);
+    return {
+      keyPrefix: k.slice(0,8),
+      index: KEY_POOL.indexOf(k),
+      active: !disabled && KEY_POOL[rotation.index]===k,
+      disabled,
+      reason: state?.reason || null,
+      disabledUntil: state ? new Date(state.disabledUntil).toISOString() : null,
+      retryAt: state ? new Date(state.disabledUntil).toISOString() : null,
+      credits
+    };
+  }));
+  const data = { poolEnabled:true, poolSize: KEY_POOL.length, activeIndex: rotation.index, activeKeyPrefix: KEY_POOL[rotation.index]?.slice(0,8) || null, loopbackOnly:true, fetchedAt:new Date().toISOString(), cacheTtlMs: POOL_USAGE_CACHE_TTL_MS, keys: results };
+  data._pool=true; poolUsageCache={at:now, data}; sendJSON(res,200,data);
+}
+async function handlePoolState(req, res) {
+  const host = (req.headers.host || '').split(':')[0];
+  const remote = (req.socket.remoteAddress || '');
+  const isLoopback = host === '127.0.0.1' || host === 'localhost' || remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+  if(!isLoopback) { sendJSON(res, 403, { error: { message: 'loopback-only', type:'forbidden'}}); return; }
+  const now=Date.now();
+  sendJSON(res,200,{
+    poolEnabled: KEY_POOL_ENABLED,
+    poolSize: KEY_POOL.length,
+    activeIndex: rotation.index,
+    activeKeyPrefix: KEY_POOL_ENABLED ? KEY_POOL[rotation.index]?.slice(0,8) : null,
+    nextRotationInMs: KEY_POOL_ENABLED ? Math.max(0, rotation.periodMs - (now - rotation.startedAt)) : 0,
+    rotationMinMinutes: CFG.keyRotationMinMinutes,
+    rotationMaxMinutes: CFG.keyRotationMaxMinutes,
+    states: [...KEY_STATE.entries()].map(([k,v])=>({keyPrefix:k.slice(0,8), reason:v.reason, disabledUntil: new Date(v.disabledUntil).toISOString()})),
+    fetchedAt: new Date().toISOString()
+  });
+}
+
 async function handleModels(req, res) {
   const apiKey = resolveApiKey(req.headers);
   if (!apiKey && KEY_POOL_ENABLED) {
@@ -2079,6 +2230,10 @@ const server = http.createServer(async (req, res) => {
       await handleMessages(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
+    } else if (url.pathname === '/pool/usage' && req.method === 'GET') {
+      await handlePoolUsage(req, res);
+    } else if (url.pathname === '/pool/state' && req.method === 'GET') {
+      await handlePoolState(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
     } else {

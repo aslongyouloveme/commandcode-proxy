@@ -6,7 +6,7 @@
   "projectSlug": "cc-proxy",
   "logFile": "proxy.log",
   "logLevel": "info",
-  "keysFile": "keys.json",
+  "keysFile": "keys.server.json",
   "keyRotationMinMinutes": 120,
   "keyRotationMaxMinutes": 180,
   "keyRetryAfterHours": 24

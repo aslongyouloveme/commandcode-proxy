@@ -9,5 +9,9 @@ stderr.txt
 captured-requests/
 .idea/
 keys.json
+keys.server.json
+keys.*.json
+deploy.env
+.env
 Codex_Router_CommandCode_Proxy_运维记录.docx
 

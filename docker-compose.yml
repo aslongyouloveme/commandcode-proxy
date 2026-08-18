@@ -1,12 +1,25 @@
 version: "3.9"
 
+# 本地:  docker compose up -d                → 读取 config.json + keys.json（无 key 也可启动）
+# 服务器: CC_SERVER_MODE=1 CC_SERVER_KEY=user_xxx docker compose up -d
+#         或在 deploy.env / .env 中配置 CC_SERVER_MODE/CC_SERVER_KEY 后再 up
 services:
   proxy:
     build: .
+    container_name: ${CONTAINER_NAME:-cc-proxy}
     ports:
       - "${PROXY_PORT:-3050}:3050"
     environment:
       PORT: "3050"
+      CC_SERVER_MODE: "${CC_SERVER_MODE:-0}"
+      CC_SERVER_KEY: "${CC_SERVER_KEY:-}"
+      # 可选覆写（留空则使用配置文件默认值）
+      CC_API_BASE: "${CC_API_BASE:-}"
+      CC_KEYS_FILE: "${CC_KEYS_FILE:-}"
+    # 服务器 keys 持久化（可选）：放开下一行可让 keys.server.json 落盘到宿主机，避免容器重建后丢失轮换状态
+    # volumes:
+    #   - ./keys.server.json:/app/keys.server.json
+    #   - ./keys.json:/app/keys.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]

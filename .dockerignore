@@ -7,3 +7,9 @@ node_modules/
 temp/
 README*.md
 AGENTS.md
+keys.json
+keys.server.json
+keys.*.json
+deploy.env
+.env
+config.server.json
