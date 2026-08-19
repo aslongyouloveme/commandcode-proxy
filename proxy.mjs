@@ -204,7 +204,7 @@ refreshCCVersion(); // 启动时立即拉取
 setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
-const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
+const STREAM_IDLE_TIMEOUT_MS = 90000;   // 90s — 流式无新数据中断（muse-spark 长思考场景）
 const NONSTREAM_IDLE_TIMEOUT_MS = 90000; // 90s — 非流式超时更宽容
 
 // 连续超时计数：连续 3 次超时才提醒压缩上下文，任意成功请求后重置
@@ -224,6 +224,19 @@ function log(level, msg, data) {
 // keys.json 存在且非空时启用：忽略请求头里的 key，按随机周期轮换池内 key。
 // 文件缺失/为空时完全退回单 key 行为，方便与上游合并。
 const KEY_STATE = new Map(); // key -> { disabledUntil, reason, disabledAt }
+
+// 额度预检缓存：key -> { checkedAt, ok, metrics }，避免每个请求都查额度
+const QUOTA_CHECK_TTL_MS = 15 * 60 * 1000; // 15min
+const quotaCheckCache = new Map();
+
+async function checkKeyQuotaCached(key) {
+  const cached = quotaCheckCache.get(key);
+  if (cached && Date.now() - cached.checkedAt < QUOTA_CHECK_TTL_MS) return cached;
+  const r = await fetchCreditsForKey(key);
+  const result = { checkedAt: Date.now(), ok: r.ok, metrics: r.metrics };
+  quotaCheckCache.set(key, result);
+  return result;
+}
 
 function loadKeyPool() {
   const file = resolve(__dirname, CFG.keysFile || 'keys.json');
@@ -297,6 +310,7 @@ function advanceRotation() {
   if (rotation.periodMs === 0) {
     rotation.startedAt = now;
     rotation.periodMs = nextRotationPeriodMs();
+    return true; // 首次：视为切换点，对新 key 做额度预检
   } else if (now - rotation.startedAt >= rotation.periodMs) {
     rotation.index = (rotation.index + 1) % KEY_POOL.length;
     rotation.startedAt = now;
@@ -305,7 +319,9 @@ function advanceRotation() {
       keyPrefix: KEY_POOL[rotation.index].slice(0, 8),
       nextInMinutes: Math.round(rotation.periodMs / 60000),
     });
+    return true;
   }
+  return false;
 }
 
 // 同步版：仅用于展示，跳过冷却中的 key（不触发额度查询）。
@@ -322,7 +338,7 @@ function pickActiveKey() {
 // 异步版：真实请求路径。冷却到期（解禁前）先查一次额度——
 // 有额度则恢复并返回；没额度则续禁随机 3-5h 并继续找下一个可用 key。
 async function pickActiveKeyAsync() {
-  advanceRotation();
+  const rotated = advanceRotation();
   const now = Date.now();
   for (let i = 0; i < KEY_POOL.length; i++) {
     const candidate = KEY_POOL[(rotation.index + i) % KEY_POOL.length];
@@ -342,7 +358,16 @@ async function pickActiveKeyAsync() {
       log('info', 'Key cooldown extended (no quota)', { keyPrefix: candidate.slice(0, 8), reason: extReason });
       continue;
     }
-    return candidate; // 健康，直接使用
+    // 健康 key：只在轮换切换点做额度预检（每 2-3h 一次），平时零额外请求，避免被识别为负载均衡
+    if (rotated) {
+      const q = await checkKeyQuotaCached(candidate);
+      if (q.ok && keyHasQuota(q.metrics)) return candidate;
+      if (!q.ok) continue; // 查询失败：跳过，不误禁健康 key
+      disableKey(candidate, 'no-quota');
+      log('info', 'Key cooldown (no quota on healthy key)', { keyPrefix: candidate.slice(0, 8), reason: 'no-quota' });
+      continue;
+    }
+    return candidate; // 平时直接使用，不查额度
   }
   return null; // 全部冷却中
 }
@@ -982,6 +1007,8 @@ function getApiKey(headers) {
 async function forwardWithKeyFailover(initialApiKey, body, incomingHeaders, signal, context = '') {
   let apiKey = initialApiKey;
   const triedKeys = new Set();
+  const MAX_FAILOVER = 1; // 单请求最多切 1 次 key，避免同一请求用多个 key 被识别为负载均衡
+  let failovers = 0;
 
   while (apiKey && !triedKeys.has(apiKey)) {
     triedKeys.add(apiKey);
@@ -999,10 +1026,19 @@ async function forwardWithKeyFailover(initialApiKey, body, incomingHeaders, sign
     if (!disableReason) return { apiKey, response, errorText };
 
     disableKey(apiKey, disableReason);
+    if (failovers >= MAX_FAILOVER) {
+      return { apiKey, response, errorText, allKeysDisabled: true };
+    }
     const nextKey = await pickActiveKeyAsync();
     if (!nextKey || triedKeys.has(nextKey)) {
       return { apiKey, response, errorText, allKeysDisabled: true };
     }
+
+    // 换 key 即换身份：丢弃客户端 session，让新 key 用独立 session+fingerprint+project slug
+    incomingHeaders = { ...incomingHeaders };
+    delete incomingHeaders['x-session-id'];
+    delete incomingHeaders['x-claude-code-session-id'];
+    failovers++;
 
     log('warn', 'Retrying CC request with next key', {
       fromKeyPrefix: apiKey.slice(0, 8),
@@ -1251,6 +1287,10 @@ async function handleChatCompletions(req, res) {
         } else {
           log('error', 'Stream error', { message: e.message });
           try { abortController.abort(); } catch {} // 打断 CC 上游
+          // 流式中途 key 失效（401/403/402/429）时禁用该 key，避免继续复用
+          if (KEY_POOL_ENABLED && /401|403|402|429|unauthor|quota|rate limit/i.test(e.message)) {
+            disableKey(apiKey, 'stream-key-error');
+          }
           if (!started) {
             sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
             return;
