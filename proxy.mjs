@@ -34,7 +34,8 @@ function loadConfig() {
     keysFile: SERVER_MODE ? 'keys.server.json' : 'keys.json',
     keyRotationMinMinutes: 3,
     keyRotationMaxMinutes: 6,
-    keyRetryAfterHours: 24,
+    keyDisableMinHours: 3,
+    keyDisableMaxHours: 5,
   };
 
   // 1) 选配置文件：服务器优先读 config.server.json，缺失则回退 config.json
@@ -67,7 +68,8 @@ function loadConfig() {
   if (process.env.CC_KEYS_FILE) defaults.keysFile = process.env.CC_KEYS_FILE;
   if (process.env.CC_KEY_ROTATION_MIN_MINUTES) defaults.keyRotationMinMinutes = parseInt(process.env.CC_KEY_ROTATION_MIN_MINUTES);
   if (process.env.CC_KEY_ROTATION_MAX_MINUTES) defaults.keyRotationMaxMinutes = parseInt(process.env.CC_KEY_ROTATION_MAX_MINUTES);
-  if (process.env.CC_KEY_RETRY_AFTER_HOURS) defaults.keyRetryAfterHours = parseFloat(process.env.CC_KEY_RETRY_AFTER_HOURS);
+  if (process.env.CC_KEY_DISABLE_MIN_HOURS) defaults.keyDisableMinHours = parseFloat(process.env.CC_KEY_DISABLE_MIN_HOURS);
+  if (process.env.CC_KEY_DISABLE_MAX_HOURS) defaults.keyDisableMaxHours = parseFloat(process.env.CC_KEY_DISABLE_MAX_HOURS);
   // apiKey 也支持环境变量（服务器模式的启动 key 走此分支）
   if (process.env.CC_API_KEY) defaults.apiKey = String(process.env.CC_API_KEY).trim();
   if (process.env.CC_SERVER_KEY) defaults.apiKey = String(process.env.CC_SERVER_KEY).trim();
@@ -254,23 +256,25 @@ function isKeyDisabled(key, now = Date.now()) {
   return Boolean(state && now < state.disabledUntil);
 }
 
+// 失败即随机禁用 3-5 小时；到期后不自动放开，先查一次额度，有额度才恢复，没额度续禁 3-5h。
 function disableKey(key, reason) {
-  const hours = CFG.keyRetryAfterHours || 24;
+  const minMs = (CFG.keyDisableMinHours || 3) * 3_600_000;
+  const maxMs = (CFG.keyDisableMaxHours || 5) * 3_600_000;
+  const cooldownMs = minMs + Math.floor(Math.random() * Math.max(1, maxMs - minMs + 1));
   KEY_STATE.set(key, {
-    disabledUntil: Date.now() + hours * 3_600_000,
+    disabledUntil: Date.now() + cooldownMs,
     reason,
     disabledAt: Date.now(),
   });
   log('warn', 'Key disabled for cooldown', {
     keyPrefix: key.slice(0, 8),
     reason,
-    retryAfterHours: hours,
+    cooldownHours: +(cooldownMs / 3_600_000).toFixed(2),
     disabled: `${KEY_STATE.size}/${KEY_POOL.length}`,
   });
 }
 
-// 冷却到期后不主动探测：key 只是重新进入候选，下次真实请求轮到它时再试一次；
-// 成功即解除禁用，失败按新原因重新冷却。
+// 真实请求成功即解除禁用（key 重新进入候选池）。
 function noteKeyHealth(apiKey, ok) {
   if (!KEY_POOL_ENABLED) return;
   if (ok && KEY_STATE.delete(apiKey)) {
@@ -278,7 +282,17 @@ function noteKeyHealth(apiKey, ok) {
   }
 }
 
-function pickActiveKey() {
+// 判定 key 是否"有额度"：余额可用 且 至少一个窗口限额有剩余；无窗口数据时退回余额>0。
+function keyHasQuota(metrics) {
+  if (!Array.isArray(metrics) || !metrics.length) return false;
+  const balance = metrics.find(m => m.kind === 'balance');
+  if (balance && balance.available === false) return false;
+  const quotas = metrics.filter(m => m.kind === 'quota');
+  if (quotas.length) return quotas.some(q => q.remaining > 0);
+  return balance ? balance.value > 0 : false;
+}
+
+function advanceRotation() {
   const now = Date.now();
   if (rotation.periodMs === 0) {
     rotation.startedAt = now;
@@ -292,9 +306,43 @@ function pickActiveKey() {
       nextInMinutes: Math.round(rotation.periodMs / 60000),
     });
   }
+}
+
+// 同步版：仅用于展示，跳过冷却中的 key（不触发额度查询）。
+function pickActiveKey() {
+  advanceRotation();
+  const now = Date.now();
   for (let i = 0; i < KEY_POOL.length; i++) {
     const candidate = KEY_POOL[(rotation.index + i) % KEY_POOL.length];
     if (!isKeyDisabled(candidate, now)) return candidate;
+  }
+  return null; // 全部冷却中
+}
+
+// 异步版：真实请求路径。冷却到期（解禁前）先查一次额度——
+// 有额度则恢复并返回；没额度则续禁随机 3-5h 并继续找下一个可用 key。
+async function pickActiveKeyAsync() {
+  advanceRotation();
+  const now = Date.now();
+  for (let i = 0; i < KEY_POOL.length; i++) {
+    const candidate = KEY_POOL[(rotation.index + i) % KEY_POOL.length];
+    const state = KEY_STATE.get(candidate);
+    if (state && now < state.disabledUntil) continue; // 仍在冷却
+    if (state) {
+      // 冷却到期：解禁前查一次额度
+      const r = await fetchCreditsForKey(candidate);
+      if (r.ok && keyHasQuota(r.metrics)) {
+        KEY_STATE.delete(candidate);
+        log('info', 'Key recovered via quota check at cooldown expiry', { keyPrefix: candidate.slice(0, 8), reason: state.reason });
+        return candidate;
+      }
+      // 没额度（或额度查询失败）：续禁随机 3-5h
+      const extReason = r.ok ? 'no-quota' : (state.reason || 'quota-check-failed');
+      disableKey(candidate, extReason);
+      log('info', 'Key cooldown extended (no quota)', { keyPrefix: candidate.slice(0, 8), reason: extReason });
+      continue;
+    }
+    return candidate; // 健康，直接使用
   }
   return null; // 全部冷却中
 }
@@ -312,7 +360,7 @@ function allKeysDisabledBody() {
   const keys = [...KEY_STATE.entries()].map(([key, state]) => ({
     keyPrefix: key.slice(0, 8),
     reason: state.reason,
-    retryAt: new Date(state.disabledUntil).toISOString(),
+    retryAt: state.disabledUntil ? new Date(state.disabledUntil).toISOString() : null,
   }));
   return {
     error: { message: 'All Command Code keys are in cooldown', type: 'rate_limit_error' },
@@ -321,8 +369,8 @@ function allKeysDisabledBody() {
   };
 }
 
-function resolveApiKey(headers) {
-  return KEY_POOL_ENABLED ? pickActiveKey() : getApiKey(headers);
+async function resolveApiKey(headers) {
+  return KEY_POOL_ENABLED ? pickActiveKeyAsync() : getApiKey(headers);
 }
 
 // ── 服务器模式访问闸门 ─────────────────────
@@ -951,7 +999,7 @@ async function forwardWithKeyFailover(initialApiKey, body, incomingHeaders, sign
     if (!disableReason) return { apiKey, response, errorText };
 
     disableKey(apiKey, disableReason);
-    const nextKey = pickActiveKey();
+    const nextKey = await pickActiveKeyAsync();
     if (!nextKey || triedKeys.has(nextKey)) {
       return { apiKey, response, errorText, allKeysDisabled: true };
     }
@@ -1010,7 +1058,7 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  let apiKey = resolveApiKey(req.headers);
+  let apiKey = await resolveApiKey(req.headers);
   if (!apiKey) {
     if (KEY_POOL_ENABLED) {
       sendJSON(res, 503, allKeysDisabledBody());
@@ -1774,7 +1822,7 @@ async function handleMessages(req, res) {
     return;
   }
 
-  let apiKey = resolveApiKey(req.headers);
+  let apiKey = await resolveApiKey(req.headers);
   if (!apiKey) {
     if (KEY_POOL_ENABLED) {
       sendJSON(res, 503, allKeysDisabledBody());
@@ -2126,6 +2174,11 @@ function toPoolMetrics(payload) {
   if(five) out.push({kind:'quota', label:'5-hour limit', unit:'credits', ...five, limit: five.cap});
   const weekly = pick(wl.weekly);
   if(weekly) out.push({kind:'quota', label:'Weekly limit', unit:'credits', ...weekly, limit: weekly.cap});
+  const monthly = Number(payload?.credits?.monthlyCredits ?? payload?.credits?.monthly_credits);
+  if(Number.isFinite(monthly)) {
+    const below = payload?.credits?.belowThreshold;
+    out.push({kind:'balance', label:'Monthly credits', unit:'credits', value: monthly, available: !(below === true)});
+  }
   return out;
 }
 async function fetchCreditsForKey(key) {
@@ -2167,6 +2220,9 @@ async function handlePoolUsage(req, res) {
   if(poolUsageCache.data && (now - poolUsageCache.at) < POOL_USAGE_CACHE_TTL_MS && poolUsageCache.data._pool) {
     sendJSON(res, 200, poolUsageCache.data); return;
   }
+  // 以真实会服务下一请求的 key 为准，而非轮转指针本身（指针可能指向冷却中的 key）
+  const activeKey = pickActiveKey();
+  const activeIdx = activeKey ? KEY_POOL.indexOf(activeKey) : -1;
   const results = await Promise.all(KEY_POOL.map(async (k) => {
     const state = KEY_STATE.get(k);
     const disabled = !!(state && Date.now() < state.disabledUntil);
@@ -2174,15 +2230,15 @@ async function handlePoolUsage(req, res) {
     return {
       keyPrefix: k.slice(0,8),
       index: KEY_POOL.indexOf(k),
-      active: !disabled && KEY_POOL[rotation.index]===k,
+      active: k === activeKey,
       disabled,
       reason: state?.reason || null,
-      disabledUntil: state ? new Date(state.disabledUntil).toISOString() : null,
-      retryAt: state ? new Date(state.disabledUntil).toISOString() : null,
+      disabledUntil: state?.disabledUntil ? new Date(state.disabledUntil).toISOString() : null,
+      retryAt: state?.disabledUntil ? new Date(state.disabledUntil).toISOString() : null,
       credits
     };
   }));
-  const data = { poolEnabled:true, poolSize: KEY_POOL.length, activeIndex: rotation.index, activeKeyPrefix: KEY_POOL[rotation.index]?.slice(0,8) || null, loopbackOnly:true, fetchedAt:new Date().toISOString(), cacheTtlMs: POOL_USAGE_CACHE_TTL_MS, keys: results };
+  const data = { poolEnabled:true, poolSize: KEY_POOL.length, activeIndex: activeIdx, activeKeyPrefix: activeKey ? activeKey.slice(0,8) : null, loopbackOnly:true, fetchedAt:new Date().toISOString(), cacheTtlMs: POOL_USAGE_CACHE_TTL_MS, keys: results };
   data._pool=true; poolUsageCache={at:now, data}; sendJSON(res,200,data);
 }
 async function handlePoolState(req, res) {
@@ -2191,15 +2247,18 @@ async function handlePoolState(req, res) {
   const isLoopback = host === '127.0.0.1' || host === 'localhost' || remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
   if(!isLoopback) { sendJSON(res, 403, { error: { message: 'loopback-only', type:'forbidden'}}); return; }
   const now=Date.now();
+  const activeKeyForState = KEY_POOL_ENABLED ? pickActiveKey() : null;
+  const activeIdxForState = activeKeyForState ? KEY_POOL.indexOf(activeKeyForState) : -1;
+  // 供池状态快照用：优先展示真实可用 key；全部冷却时为空，避免指向不可用指针
   sendJSON(res,200,{
     poolEnabled: KEY_POOL_ENABLED,
     poolSize: KEY_POOL.length,
-    activeIndex: rotation.index,
-    activeKeyPrefix: KEY_POOL_ENABLED ? KEY_POOL[rotation.index]?.slice(0,8) : null,
+    activeIndex: activeIdxForState,
+    activeKeyPrefix: activeKeyForState ? activeKeyForState.slice(0,8) : null,
     nextRotationInMs: KEY_POOL_ENABLED ? Math.max(0, rotation.periodMs - (now - rotation.startedAt)) : 0,
     rotationMinMinutes: CFG.keyRotationMinMinutes,
     rotationMaxMinutes: CFG.keyRotationMaxMinutes,
-    states: [...KEY_STATE.entries()].map(([k,v])=>({keyPrefix:k.slice(0,8), reason:v.reason, disabledUntil: new Date(v.disabledUntil).toISOString()})),
+    states: [...KEY_STATE.entries()].map(([k,v])=>({keyPrefix:k.slice(0,8), reason:v.reason, disabledUntil: v.disabledUntil ? new Date(v.disabledUntil).toISOString() : null})),
     fetchedAt: new Date().toISOString()
   });
 }
@@ -2209,7 +2268,7 @@ async function handleModels(req, res) {
     sendJSON(res, 401, { object: 'error', error: { type: 'authentication_error', message: 'Unauthorized: invalid or missing server key' } });
     return;
   }
-  const apiKey = resolveApiKey(req.headers);
+  const apiKey = await resolveApiKey(req.headers);
   if (!apiKey && KEY_POOL_ENABLED) {
     sendJSON(res, 503, allKeysDisabledBody());
     return;

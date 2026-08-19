@@ -9,5 +9,6 @@
   "keysFile": "keys.server.json",
   "keyRotationMinMinutes": 120,
   "keyRotationMaxMinutes": 180,
-  "keyRetryAfterHours": 24
+  "keyDisableMinHours": 3,
+  "keyDisableMaxHours": 5
 }
