@@ -4,9 +4,18 @@
 
 A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
 
-Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
+Built by analyzing official CLI network traffic to reproduce the Command Code server protocol documented in [`commandcode-cli-server-protocol-v1.27.1.md`](../commandcode-cli-server-protocol-v1.27.1.md), including device-fingerprint and lifecycle pre-requests.
 
 **Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+
+## Protocol Boundaries
+
+The proxy has two explicit protocol boundaries:
+
+- **Downstream:** `/v1/chat/completions` and `/v1/messages` remain OpenAI/Anthropic-compatible adapters.
+- **Upstream:** every generation, fingerprint, lifecycle, and billing request uses the CLI v1.27.1 headers and envelope. Generation always uses the CLI NDJSON stream shape, preserves `finish`/`abort` terminal state, and continues `pause_turn` on the same session/thread (up to three attempts).
+
+`GET /v1/models` may use `/provider/v1/models` when `useProviderModels` is enabled. That route is a proxy-only model-discovery extension; it is not presented as a CLI endpoint and does not change the canonical upstream generation protocol.
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -55,6 +64,9 @@ commandcode/
 | `host` | `0.0.0.0` | Listen address |
 | `apiBase` | `https://api.commandcode.ai` | CC API base URL |
 | `projectSlug` | `cc-proxy` | `x-project-slug` header |
+| `tasteLearning` | `true` | `x-taste-learning` generation flag |
+| `coFlag` | `false` | `x-co-flag` generation flag |
+| `telemetry` | `true` | Send CLI lifecycle telemetry during key initialization |
 | `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
@@ -71,6 +83,11 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_CLI_VERSION` | Upstream protocol version (default `1.27.1`) |
+| `CC_API_ENV` | Upstream environment (`local`, `staging`, or `production`) |
+| `CC_TASTE_LEARNING` | Override `tasteLearning` |
+| `CC_CO_FLAG` | Override `coFlag` |
+| `CC_TELEMETRY=false` / `DO_NOT_TRACK=1` | Disable lifecycle telemetry pre-request |
 
 ## API Endpoints
 
@@ -236,7 +253,7 @@ data: {"type":"message_stop"}
 
 ### `GET /v1/models`
 
-Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
+Returns available model list. When `useProviderModels` is enabled, the proxy-only Provider API is queried with the shared CLI-compatible headers (5 min cache); otherwise, or on failure, it falls back to the hardcoded list.
 
 ### `GET /health`
 
@@ -248,7 +265,7 @@ Health check. Returns `OK`.
 |-------------|-------------|
 | 400 | Invalid request format |
 | 401 | API Key missing / invalid format / rejected (Key must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
-| 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
+| 429 | Zero output tokens, or idle timeout (90s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
 | 502 | CC upstream error |
 
 ## Model List
@@ -347,15 +364,17 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
-| **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
+| **Protocol Version** | `x-command-code-version: 1.27.1` by default; `CC_CLI_VERSION` can pin a test-compatible value. A separate npm check only records the installed runtime version. |
 | **CLI Envelope** | config/memory/taste/skills/permissionMode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production`, `x-co-flag: "false"`, `x-taste-learning: "false"` |
-| **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
+| **Environment** | `x-cli-environment` is `production` by default and can be set to `local`/`staging`; generation also carries `x-co-flag` and `x-taste-learning`. |
+| **Project Slug** | Forwarded `x-project-slug`, configured `projectSlug`, or a deterministic proxy slug |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
-| **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
+| **Stream Timeout** | 90s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
+| **Continuation** | `pause_turn` appends the assistant blocks and reissues the same CLI request with the same session/thread, bounded to three attempts |
+| **Terminal Guard** | EOF without `finish`/`abort` is a retryable `truncated_stream`; it never becomes a normal downstream completion |
 | **Zero-Output Guard** | outputTokens=0 → 429 `rate_limit_error` (SDK auto-retry, anti false billing) |
 | **Upstream Abort** | `AbortController` on client disconnect + all error paths |
 | **Privacy Logging** | No API key fragments, no error bodies, no stack traces in logs |
@@ -379,11 +398,14 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
   },
   "memory": null,
   "taste": null,
-  "skills": "",
+  "skills": null,
   "permissionMode": "standard",
+  "threadId": "uuid",
+  "mode": "interactive",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
+    "tools": [],
     "max_tokens": 64000,
     "stream": true,
     "reasoning_effort": "max"
@@ -391,7 +413,7 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 }
 ```
 
-Conditional fields: `system` (extracted from `system` messages), `temperature`, `reasoning_effort`, `tools` (mapped to CC `input_schema` format).
+Conditional fields: `system` (extracted from `system` messages), `temperature`, and `reasoning_effort`. `tools` is always an array and uses CC `input_schema` format. Downstream-only `tool_choice` and `parallel_tool_calls` are not sent in `params`.
 
 ### CC API Image Message Format
 

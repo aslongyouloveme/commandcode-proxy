@@ -19,6 +19,16 @@ function close(server) {
   return new Promise(resolve => server.close(() => resolve()));
 }
 
+async function reservePort() {
+  const server = http.createServer();
+  const port = await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+  });
+  await close(server);
+  return port;
+}
+
 async function waitForHealth(url, child) {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
@@ -57,6 +67,14 @@ test('retries a 400 insufficient-credits response with the next key', async () =
       ].join('\n'));
       return;
     }
+    if (req.url === '/alpha/billing/credits') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        windowLimits: { fiveHour: { cap: 100, used: 1 } },
+        credits: { monthlyCredits: 100, belowThreshold: false },
+      }));
+      return;
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{}');
   });
@@ -66,7 +84,7 @@ test('retries a 400 insufficient-credits response with the next key', async () =
   const keysFile = join(tempDir, 'keys.json');
   await writeFile(keysFile, JSON.stringify([exhaustedKey, healthyKey]));
 
-  const proxyPort = upstreamPort + 1;
+  const proxyPort = await reservePort();
   const proxyUrl = `http://127.0.0.1:${proxyPort}`;
   const child = spawn(process.execPath, ['proxy.mjs'], {
     cwd: proxyDir,

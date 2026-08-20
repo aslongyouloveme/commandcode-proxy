@@ -4,9 +4,18 @@
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
 
-基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
+基于对官方 CLI 网络流量的分析，按 [`commandcode-cli-server-protocol-v1.27.1.md`](../commandcode-cli-server-protocol-v1.27.1.md) 还原 Command Code server 协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
 
 **完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+
+## 协议边界
+
+代理明确分为两层：
+
+- **下游：** `/v1/chat/completions` 和 `/v1/messages` 继续提供 OpenAI/Anthropic 兼容适配。
+- **上游：** 所有生成、指纹、生命周期和额度请求都使用 CLI v1.27.1 的 header 与请求信封。生成请求固定采用 CLI NDJSON 流格式，严格识别 `finish`/`abort` 终止事件，并在同一 session/thread 上续接 `pause_turn`（最多三次）。
+
+`GET /v1/models` 在启用 `useProviderModels` 时可以访问 `/provider/v1/models`。这是代理自身的可选模型发现扩展，不是 CLI 路由，也不会改变上游生成协议。
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -55,6 +64,9 @@ commandcode/
 | `host` | `0.0.0.0` | 监听地址 |
 | `apiBase` | `https://api.commandcode.ai` | CC API 地址 |
 | `projectSlug` | `cc-proxy` | `x-project-slug` header |
+| `tasteLearning` | `true` | `x-taste-learning` 生成标志 |
+| `coFlag` | `false` | `x-co-flag` 生成标志 |
+| `telemetry` | `true` | 初始化 Key 时是否发送 CLI 生命周期 telemetry |
 | `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
@@ -71,6 +83,11 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_CLI_VERSION` | 上游协议版本（默认 `1.27.1`） |
+| `CC_API_ENV` | 上游环境（`local`、`staging`、`production`） |
+| `CC_TASTE_LEARNING` | 覆盖 `tasteLearning` |
+| `CC_CO_FLAG` | 覆盖 `coFlag` |
+| `CC_TELEMETRY=false` / `DO_NOT_TRACK=1` | 关闭生命周期 telemetry 预请求 |
 
 ## API 接口
 
@@ -236,7 +253,7 @@ data: {"type":"message_stop"}
 
 ### `GET /v1/models`
 
-返回可用模型列表。优先从 Provider API 动态拉取（5min 缓存），失败回退硬编码列表。
+返回可用模型列表。启用 `useProviderModels` 时，使用共享的 CLI 兼容 header 从代理专用 Provider API 拉取（5min 缓存）；关闭或失败时回退硬编码列表。
 
 ### `GET /health`
 
@@ -248,7 +265,7 @@ data: {"type":"message_stop"}
 |-----------|------|
 | 400 | 请求格式错误 |
 | 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入） |
-| 429 | 零输出 token，或流空闲超时（30s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
+| 429 | 零输出 token，或流空闲超时（90s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
 | 502 | CC 上游错误 |
 
 ## 模型列表
@@ -347,15 +364,17 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
 | **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
-| **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
+| **协议版本** | 默认发送 `x-command-code-version: 1.27.1`，可用 `CC_CLI_VERSION` 固定测试版本；npm 检查仅记录运行时版本，不改变协议版本 |
 | **CLI 信封格式** | config/memory/taste/skills/permissionMode/params |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production`、`x-co-flag: "false"`、`x-taste-learning: "false"` |
-| **Project Slug** | 从 sessionId 生成的 `x-project-slug`（与真实 CLI 格式一致） |
+| **环境标识** | `x-cli-environment` 默认 `production`，可设为 `local`/`staging`；生成请求同时携带 `x-co-flag` 和 `x-taste-learning` |
+| **Project Slug** | 优先使用入站 `x-project-slug`，其次是配置 `projectSlug`，最后使用确定性的 proxy slug |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
-| **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
+| **流式超时保护** | 流式 90s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
+| **续接控制** | `pause_turn` 将 assistant 内容追加到下一次同 session/thread 的 CLI 请求，最多三次 |
+| **终止保护** | 上游 EOF 且没有 `finish`/`abort` 时返回可重试的 `truncated_stream`，不会伪造正常完成 |
 | **零输出防护** | outputTokens=0 → 429 `rate_limit_error`（SDK 自动重试，反异常计费） |
 | **上游中止** | 客户端断连 + 全部错误路径 `AbortController` 打断 CC |
 | **隐私保护日志** | 日志不含 API Key 片段、错误 body、stack trace |
@@ -379,11 +398,14 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
   },
   "memory": null,
   "taste": null,
-  "skills": "",
+  "skills": null,
   "permissionMode": "standard",
+  "threadId": "uuid",
+  "mode": "interactive",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
+    "tools": [],
     "max_tokens": 64000,
     "stream": true,
     "reasoning_effort": "max"
@@ -391,7 +413,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 }
 ```
 
-条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`、`tools`（映射为 CC `input_schema` 格式）。
+条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`。`tools` 始终为数组并映射为 CC `input_schema` 格式。下游专用的 `tool_choice` 和 `parallel_tool_calls` 不会发送到 `params`。
 
 ### CC API 图片消息格式
 
