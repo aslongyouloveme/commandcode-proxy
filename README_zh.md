@@ -369,7 +369,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **环境标识** | `x-cli-environment` 默认 `production`，可设为 `local`/`staging`；生成请求同时携带 `x-co-flag` 和 `x-taste-learning` |
 | **Project Slug** | 优先使用入站 `x-project-slug`，其次是配置 `projectSlug`，最后使用确定性的 proxy slug |
-| **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
+| **思考强度** | 所有发往 Command Code 上游的生成请求统一强制为 `reasoning_effort: max` |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 90s、非流式 90s → 429 + SDK 自动重试 |
 | **连续超时阈值** | 连续 3 次超时后才提示压缩上下文 |
@@ -401,7 +401,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
   "skills": null,
   "permissionMode": "standard",
   "threadId": "uuid",
-  "mode": "interactive",
+  "mode": "agent",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
@@ -413,7 +413,7 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 }
 ```
 
-条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`。`tools` 始终为数组并映射为 CC `input_schema` 格式。下游专用的 `tool_choice` 和 `parallel_tool_calls` 不会发送到 `params`。
+`mode` 会归一化为 server 支持的值：`agent`、`learning`、`custom-agent`、`custom-agent-create`、`title-gen`、`tool-desc`、`compact` 或 `vision`；下游传入不支持的值时回退为 `agent`。条件字段：`system`（从 system 消息提取）、`temperature`、`reasoning_effort`。`tools` 始终为数组并映射为 CC `input_schema` 格式。下游专用的 `tool_choice` 和 `parallel_tool_calls` 不会发送到 `params`。
 
 ### CC API 图片消息格式
 

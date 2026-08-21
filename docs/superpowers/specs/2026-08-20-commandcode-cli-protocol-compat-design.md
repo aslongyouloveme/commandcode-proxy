@@ -66,11 +66,13 @@ ProtocolContext {
 ### 来源和默认值
 
 - `apiKey`：沿用现有 server gate、请求 key、配置 key 和 key pool 选择逻辑。
-- `sessionId`：优先使用入站 `x-session-id` 或
-  `x-claude-code-session-id`，否则使用当前 key 的长期 session。
+- `sessionId`：仅在入站 `x-session-id` 或 `x-claude-code-session-id` 为合法 UUID
+  时透传，否则使用当前 key 的长期 UUID session。
 - `threadId`：优先使用合法入站 `x-thread-id`；没有时为当前入站请求生成一个
   UUID，并写入 `/alpha/generate` body。相同请求的 continuation 必须复用它。
-- `mode`：使用入站 `x-command-code-mode`，没有时为 `interactive`。
+- `mode`：使用入站 `x-command-code-mode` 或下游请求 mode，并归一化到 server 支持的
+  `agent`、`learning`、`custom-agent`、`custom-agent-create`、`title-gen`、`tool-desc`、
+  `compact`、`vision`；缺省或不支持的值为 `agent`。
 - `environment`：由 `CC_API_BASE` 的主机和显式 `CC_API_ENV` 推导，默认
   `production`；不再固定为 production。
 - `cliVersion`：默认 `1.27.1`，可由 `CC_CLI_VERSION` 覆盖；npm 动态刷新只
@@ -124,7 +126,7 @@ proxy 有活动 trace context 时发送，不再每次伪造。
   "skills": null,
   "permissionMode": "standard",
   "threadId": "<UUID>",
-  "mode": "interactive",
+  "mode": "agent",
   "params": {
     "model": "...",
     "messages": [],

@@ -27,7 +27,7 @@ Anthropic /v1/messages        ─┘                  │
   │
   ├─ 解析 JSON、server gate、解析/选择 user_ API key
   ├─ 为本次请求创建 ProtocolContext
-  │    ├─ sessionId：入站 session 或按 key 复用的长期 session
+  │    ├─ sessionId：合法入站 UUID 或按 key 复用的长期 UUID session
   │    ├─ 合法 x-thread-id，否则生成 UUID
   │    ├─ mode / environment / projectSlug / tasteLearning / coFlag
   │    └─ config：proxy 本地事实，可由 x-working-dir / x-git-* 覆盖
@@ -117,7 +117,7 @@ x-command-code-version: 1.27.1
   "skills": null,
   "permissionMode": "standard",
   "threadId": "<UUID>",
-  "mode": "interactive",
+  "mode": "agent",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [],
@@ -127,6 +127,8 @@ x-command-code-version: 1.27.1
   }
 }
 ```
+
+`mode` 只允许 `agent`、`learning`、`custom-agent`、`custom-agent-create`、`title-gen`、`tool-desc`、`compact`、`vision`；下游传入不支持的值时回退为 `agent`。`x-session-id` 只有合法 UUID 才会透传，否则生成 proxy UUID session。
 
 转换规则：
 

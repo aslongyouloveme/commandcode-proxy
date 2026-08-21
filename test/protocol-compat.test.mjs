@@ -133,7 +133,7 @@ test('emits the CLI v1.27.1 headers and body shape upstream', async () => {
     const response = await fetch(`${server.proxyUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: baseHeaders({
-        'x-session-id': 'session-protocol-123',
+        'x-session-id': '123e4567-e89b-12d3-a456-426614174010',
         'x-thread-id': '123e4567-e89b-12d3-a456-426614174000',
         'x-command-code-mode': 'plan',
         'x-cmd-zdr': '1',
@@ -157,13 +157,13 @@ test('emits the CLI v1.27.1 headers and body shape upstream', async () => {
     assert.equal(headers['user-agent'], 'cli');
     assert.equal(headers['x-cli-environment'], 'local');
     assert.equal(headers['x-command-code-version'], '1.27.1');
-    assert.equal(headers['x-session-id'], 'session-protocol-123');
+    assert.equal(headers['x-session-id'], '123e4567-e89b-12d3-a456-426614174010');
     assert.equal(headers['x-project-slug'], 'protocol-project');
     assert.equal(headers['x-taste-learning'], 'true');
     assert.equal(headers['x-co-flag'], 'true');
     assert.equal(headers['x-cmd-zdr'], '1');
     assert.equal(ccBody.threadId, '123e4567-e89b-12d3-a456-426614174000');
-    assert.equal(ccBody.mode, 'plan');
+    assert.equal(ccBody.mode, 'agent');
     assert.equal(ccBody.skills, null);
     assert.equal(ccBody.params.stream, true);
     assert.equal('tool_choice' in ccBody.params, false);
@@ -173,6 +173,82 @@ test('emits the CLI v1.27.1 headers and body shape upstream', async () => {
       description: '',
       input_schema: { type: 'object' },
     });
+  } finally {
+    await server.stop();
+  }
+});
+
+test('forces max reasoning for every model sent upstream', async () => {
+  const generateBodies = [];
+  const upstream = async (req, res) => {
+    const body = await readJson(req);
+    if (req.url === '/alpha/generate') {
+      generateBodies.push(body);
+      sendNdjson(res, [
+        { type: 'text-delta', text: 'max-ok' },
+        { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } },
+      ]);
+      return;
+    }
+    sendJson(res, {});
+  };
+  const server = await startProxy(upstream);
+
+  try {
+    const requests = [
+      { model: 'deepseek/deepseek-v4-pro', reasoning_effort: 'high' },
+      { model: 'deepseek/deepseek-v4-flash' },
+      { model: 'stealth/ox-alpha', reasoning_effort: 'low' },
+    ];
+    for (const request of requests) {
+      const response = await fetch(`${server.proxyUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: baseHeaders(),
+        body: JSON.stringify({
+          ...request,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      });
+      assert.equal(response.status, 200, await response.text());
+    }
+
+    assert.deepEqual(
+      generateBodies.map(body => ({ model: body.params.model, effort: body.params.reasoning_effort })),
+      [
+        { model: 'deepseek/deepseek-v4-pro', effort: 'max' },
+        { model: 'deepseek/deepseek-v4-flash', effort: 'max' },
+        { model: 'stealth/ox-alpha', effort: 'max' },
+      ],
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
+test('replaces a non-UUID incoming session id with a CLI-compatible UUID', async () => {
+  let generationHeaders;
+  const upstream = async (req, res) => {
+    await readJson(req);
+    if (req.url === '/alpha/generate') {
+      generationHeaders = req.headers;
+      sendNdjson(res, [
+        { type: 'text-delta', text: 'session-ok' },
+        { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } },
+      ]);
+      return;
+    }
+    sendJson(res, {});
+  };
+  const server = await startProxy(upstream);
+
+  try {
+    const response = await fetch(`${server.proxyUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: baseHeaders({ 'x-session-id': 'opaque-client-session' }),
+      body: JSON.stringify({ model: 'deepseek/deepseek-v4-pro', messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.match(generationHeaders['x-session-id'], /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
   } finally {
     await server.stop();
   }
@@ -223,9 +299,9 @@ test('keeps provider model discovery optional and uses shared CLI headers when e
 test('uses CLI helper headers and skips lifecycle telemetry when disabled', async () => {
   const helperRequests = [];
   const upstream = async (req, res) => {
-    await readJson(req);
+    const requestBody = await readJson(req);
     if (req.url === '/alpha/fingerprint/record' || req.url === '/alpha/lifecycle-events') {
-      helperRequests.push({ path: req.url, headers: req.headers });
+      helperRequests.push({ path: req.url, headers: req.headers, body: requestBody });
       sendJson(res, {});
       return;
     }
@@ -255,6 +331,37 @@ test('uses CLI helper headers and skips lifecycle telemetry when disabled', asyn
     assert.equal(headers['x-command-code-version'], '1.27.1');
     assert.equal(headers['x-session-id'], undefined);
     assert.equal(headers['x-project-slug'], undefined);
+    assert.equal(helperRequests[0].body.eventType, undefined);
+  } finally {
+    await server.stop();
+  }
+});
+
+test('keeps lifecycle telemetry mode separate from generation mode', async () => {
+  const lifecycleBodies = [];
+  const upstream = async (req, res) => {
+    const requestBody = await readJson(req);
+    if (req.url === '/alpha/lifecycle-events') lifecycleBodies.push(requestBody);
+    if (req.url === '/alpha/generate') {
+      sendNdjson(res, [
+        { type: 'text-delta', text: 'ok' },
+        { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } },
+      ]);
+      return;
+    }
+    sendJson(res, {});
+  };
+  const server = await startProxy(upstream);
+
+  try {
+    const response = await fetch(`${server.proxyUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: baseHeaders({ 'x-command-code-mode': 'vision' }),
+      body: JSON.stringify({ model: 'deepseek/deepseek-v4-pro', messages: [{ role: 'user', content: 'hello' }] }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(lifecycleBodies.length, 1);
+    assert.equal(lifecycleBodies[0].metadata.mode, 'interactive');
   } finally {
     await server.stop();
   }
@@ -287,7 +394,7 @@ test('continues a pause_turn on the same upstream session and thread', async () 
     const response = await fetch(`${server.proxyUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: baseHeaders({
-        'x-session-id': 'session-pause-123',
+        'x-session-id': '123e4567-e89b-12d3-a456-426614174011',
         'x-thread-id': '123e4567-e89b-12d3-a456-426614174001',
       }),
       body: JSON.stringify({
@@ -302,8 +409,8 @@ test('continues a pause_turn on the same upstream session and thread', async () 
     assert.match(body, /first/);
     assert.match(body, /second/);
     assert.equal(generateRequests.length, 2);
-    assert.equal(generateRequests[0].headers['x-session-id'], 'session-pause-123');
-    assert.equal(generateRequests[1].headers['x-session-id'], 'session-pause-123');
+    assert.equal(generateRequests[0].headers['x-session-id'], '123e4567-e89b-12d3-a456-426614174011');
+    assert.equal(generateRequests[1].headers['x-session-id'], '123e4567-e89b-12d3-a456-426614174011');
     assert.equal(generateRequests[0].body.threadId, generateRequests[1].body.threadId);
     assert.equal(generateRequests[1].body.threadId, '123e4567-e89b-12d3-a456-426614174001');
     assert.ok(generateRequests[1].body.params.messages.some(message =>

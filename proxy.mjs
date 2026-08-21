@@ -458,7 +458,7 @@ function getSessionId(incomingHeaders, apiKey) {
     incomingHeaders['x-claude-code-session-id'],
   ];
   for (const id of candidates) {
-    if (id && typeof id === 'string' && id.length >= 8) return id;
+    if (isUuid(id)) return id;
   }
   // 按 API Key 分 session
   return ensureSession(apiKey);
@@ -536,11 +536,22 @@ function normalizePermissionMode(value) {
   }
 }
 
+const VALID_PROTOCOL_MODES = new Set([
+  'agent', 'learning', 'custom-agent', 'custom-agent-create',
+  'title-gen', 'tool-desc', 'compact', 'vision',
+]);
+
+function normalizeProtocolMode(value) {
+  const mode = String(value || '').trim().toLowerCase();
+  return VALID_PROTOCOL_MODES.has(mode) ? mode : 'agent';
+}
+
 function createProtocolContext(incomingHeaders = {}, apiKey, openaiReq = {}) {
   const sessionId = getSessionId(incomingHeaders, apiKey);
   const incomingThreadId = headerValue(incomingHeaders, 'x-thread-id');
-  const mode = headerValue(incomingHeaders, 'x-command-code-mode') ||
-    (typeof openaiReq.mode === 'string' ? openaiReq.mode : 'interactive');
+  const requestedMode = headerValue(incomingHeaders, 'x-command-code-mode') ||
+    (typeof openaiReq.mode === 'string' ? openaiReq.mode : 'agent');
+  const mode = normalizeProtocolMode(requestedMode);
   const projectSlug = headerValue(incomingHeaders, 'x-project-slug') || CFG.projectSlug || fakeProjectSlug(sessionId);
   const tasteLearning = parseBoolean(
     headerValue(incomingHeaders, 'x-taste-learning') || process.env.CC_TASTE_LEARNING,
@@ -559,6 +570,7 @@ function createProtocolContext(incomingHeaders = {}, apiKey, openaiReq = {}) {
     sessionId,
     threadId: isUuid(incomingThreadId) ? incomingThreadId : randomUUID(),
     mode,
+    lifecycleMode: 'interactive',
     environment: getProtocolEnvironment(),
     cliVersion: getProtocolVersion(),
     projectSlug,
@@ -668,7 +680,7 @@ async function ensureInitialized(apiKey, signal, context = null) {
             metadata: {
               sessionId: context?.sessionId || ensureSession(apiKey),
               cliVersion: context?.cliVersion || getProtocolVersion(),
-              mode: context?.mode || 'interactive',
+              mode: context?.lifecycleMode || 'interactive',
               os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
             },
           }),
@@ -783,7 +795,7 @@ function contentToText(content) {
 }
 
 function buildCcRequest(openaiReq, context) {
-  const { model, messages = [], max_tokens, temperature, tools, reasoning_effort } = openaiReq;
+  const { model, messages = [], max_tokens, temperature, tools } = openaiReq;
 
   // 从 messages 中提取 system prompt
   const systemMsgs = messages.filter(m => m.role === 'system');
@@ -898,9 +910,9 @@ function buildCcRequest(openaiReq, context) {
   if (temperature !== undefined) {
     body.params.temperature = temperature;
   }
-  if (reasoning_effort !== undefined) {
-    body.params.reasoning_effort = reasoning_effort;
-  }
+  // Keep every Command Code upstream generation at the maximum reasoning tier.
+  // This applies equally to local/server modes and to OpenAI/Anthropic inputs.
+  body.params.reasoning_effort = 'max';
   return body;
 }
 

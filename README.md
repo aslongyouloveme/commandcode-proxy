@@ -369,7 +369,7 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **Environment** | `x-cli-environment` is `production` by default and can be set to `local`/`staging`; generation also carries `x-co-flag` and `x-taste-learning`. |
 | **Project Slug** | Forwarded `x-project-slug`, configured `projectSlug`, or a deterministic proxy slug |
-| **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
+| **Reasoning Effort** | Every Command Code upstream generation request is forced to `reasoning_effort: max` |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 90s streaming / 90s non-streaming → 429 with SDK auto-retry |
 | **Consecutive Timeout** | 3 consecutive timeouts before "reduce context" hint |
@@ -401,7 +401,7 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
   "skills": null,
   "permissionMode": "standard",
   "threadId": "uuid",
-  "mode": "interactive",
+  "mode": "agent",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
     "messages": [...],
@@ -413,7 +413,7 @@ Based on analysis of official CLI traffic (version auto-fetched from npm registr
 }
 ```
 
-Conditional fields: `system` (extracted from `system` messages), `temperature`, and `reasoning_effort`. `tools` is always an array and uses CC `input_schema` format. Downstream-only `tool_choice` and `parallel_tool_calls` are not sent in `params`.
+`mode` is normalized to one of the server-supported values: `agent`, `learning`, `custom-agent`, `custom-agent-create`, `title-gen`, `tool-desc`, `compact`, or `vision`; unsupported downstream values fall back to `agent`. Conditional fields: `system` (extracted from `system` messages), `temperature`, and `reasoning_effort`. `tools` is always an array and uses CC `input_schema` format. Downstream-only `tool_choice` and `parallel_tool_calls` are not sent in `params`.
 
 ### CC API Image Message Format
 
